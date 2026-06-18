@@ -1,0 +1,41 @@
+# System Configuration for Agentic PDF Search System
+
+app:
+  name: "Agentic PDF Search System"
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+
+database:
+  url: "postgresql+asyncpg://postgres:postgres@localhost:5432/pdf_search"
+  sync_url: "postgresql://postgres:postgres@localhost:5432/pdf_search"
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+
+qdrant:
+  url: "http://localhost:6333"
+  prefer_grpc: false
+
+elasticsearch:
+  hosts: ["http://localhost:9200"]
+
+embeddings:
+  # Using BAAI/bge-m3. Can be loaded locally via SentenceTransformers or requested via Ollama/external service
+  model_name: "BAAI/bge-m3"
+  use_ollama: true
+  ollama_url: "http://localhost:11434"
+
+llm:
+  # Qwen3 / Qwen3-VL configuration
+  reasoning_model: "qwen3:latest"
+  vision_model: "qwen3-vl:latest"
+  ollama_url: "http://localhost:11434"
+  temperature: 0.1
+
+storage:
+  upload_dir: "./storage/uploads"
+  temp_dir: "./storage/temp"
+  max_file_size_mb: 50
