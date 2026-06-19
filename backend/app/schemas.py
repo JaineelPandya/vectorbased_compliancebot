@@ -10,6 +10,11 @@ class DocumentBase(BaseModel):
     issue_date: Optional[date] = None
     department: Optional[str] = None
     tags: Optional[List[str]] = Field(default_factory=list)
+    keywords: Optional[List[str]] = Field(default_factory=list)
+    topics: Optional[List[str]] = Field(default_factory=list)
+    entities: Optional[List[str]] = Field(default_factory=list)
+    financial_terms: Optional[List[str]] = Field(default_factory=list)
+    circular_type: Optional[str] = None
 
 class DocumentCreate(DocumentBase):
     pass
@@ -49,17 +54,19 @@ class QueryRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None  # e.g., {"department": "SEBI", "start_date": "2026-01-01"}
 
 class Citation(BaseModel):
-    document_name: str
-    page_number: int
-    section: Optional[str] = None
-    circular_number: Optional[str] = None
-    version: int
+    doc_id: str
+    title: str = "Unknown Title"
+    page_number: int = 1
+    section: str = "Unknown Section"
+    circular_number: str = ""
+    version: int = 1
 
 class QueryResponse(BaseModel):
     query: str
     answer: str
     citations: List[Citation]
     agent_trace_session_id: str
+    warning: Optional[str] = None  # Warning if document titles are vague
 
 # --- Agent Trace Schemas ---
 class AgentTraceResponse(BaseModel):

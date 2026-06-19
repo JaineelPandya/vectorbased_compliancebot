@@ -1,5 +1,6 @@
 import logging
 import uuid
+import os
 from typing import List, Optional
 from datetime import date
 from backend.app.services.redis_cache import redis_cache
@@ -44,7 +45,7 @@ async def upload_pdf(
         raise HTTPException(status_code=400, detail="Only PDF file uploads are supported.")
 
     # Save file to upload directory
-    file_name = name or file.filename
+    upload_name = name.strip() if name and name.strip() else None
     temp_path = os.path.join(settings.storage.temp_dir, f"{uuid.uuid4()}_{file.filename}")
     
     try:
@@ -58,7 +59,7 @@ async def upload_pdf(
         # Run Ingestion
         document = await pdf_processor.ingest_pdf(
             file_path=temp_path,
-            name=file_name,
+            name=upload_name,
             circular_number=circular_number,
             issue_date=issue_date,
             department=department,
@@ -96,6 +97,88 @@ async def query_system(payload: QueryRequest):
     except Exception as e:
         logger.error(f"Query API failed: {e}")
         raise HTTPException(status_code=500, detail=f"Search pipeline error: {str(e)}")
+
+from backend.app.services.reranker import reranker
+
+@router.get("/debug/retrieval")
+async def debug_retrieval(query: str):
+    """Debug endpoint to see raw vs reranked chunks directly."""
+    try:
+        from backend.app.services.embeddings import embedding_service
+        vector = await embedding_service.get_embedding(query)
+        
+        qdrant_results = await qdrant_store.search_collection(vector, limit=50)
+        
+        es_results = await search_store.search_chunks(query, limit=20)
+        
+        merged = []
+        seen = set()
+        for r in qdrant_results + es_results:
+            text = r.get("payload", {}).get("text", "")
+            import hashlib
+            h = hashlib.sha256(text.encode()).hexdigest()
+            if h not in seen:
+                seen.add(h)
+                merged.append(r.get("payload", {}))
+                
+        reranked = reranker.rerank(query, merged, top_k=8)
+        
+        return {
+            "query": query,
+            "qdrant_results": len(qdrant_results),
+            "elastic_results": len(es_results),
+            "reranked_results": reranked
+        }
+    except Exception as e:
+        logger.error(f"Debug retrieval failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/debug/chunk/{doc_id}")
+async def debug_chunk(doc_id: str):
+    """Debug endpoint to verify chunking accuracy and metadata payload in ES."""
+    try:
+        # Search Elasticsearch for all chunks belonging to this doc_id
+        results = await search_store.search_chunks("", limit=100, filters={"doc_id": doc_id})
+        return results
+    except Exception as e:
+        logger.error(f"Debug chunk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/debug/vague-documents")
+async def debug_vague_documents():
+    """Debug endpoint to identify documents with vague or missing names."""
+    try:
+        results = await search_store.search_chunks("", limit=1000)
+        vague_docs = {}
+        
+        for result in results:
+            payload = result.get("payload", {})
+            title = payload.get("title")
+            doc_id = payload.get("doc_id")
+            
+            # Identify vague document titles
+            if not title or title == "Unknown Title" or len(title.strip()) == 0:
+                if doc_id not in vague_docs:
+                    vague_docs[doc_id] = {
+                        "title": title or "NOT PROVIDED",
+                        "chunk_count": 0,
+                        "pages": set()
+                    }
+                vague_docs[doc_id]["chunk_count"] += 1
+                vague_docs[doc_id]["pages"].add(payload.get("page_number"))
+        
+        # Convert sets to lists for JSON serialization
+        for doc_id in vague_docs:
+            vague_docs[doc_id]["pages"] = sorted(list(vague_docs[doc_id]["pages"]))
+        
+        return {
+            "vague_documents_found": len(vague_docs),
+            "details": vague_docs,
+            "recommendation": "Please review documents with missing titles. Titles are generated from first-page content and should be descriptive of the document content."
+        }
+    except Exception as e:
+        logger.error(f"Debug vague documents failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/documents", response_model=List[DocumentResponse])
 async def list_documents(db: AsyncSession = Depends(get_db)):
@@ -184,4 +267,161 @@ async def health_check():
         
     return health_status
 
-import os
+@router.post("/document/{id}/reindex-metadata")
+async def reindex_document_metadata(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Re-runs LLM metadata extraction (keywords, topics, entities, financial_terms) 
+    for an existing document and updates PostgreSQL, Qdrant, and Elasticsearch.
+    Use this when a document's keywords are missing or incorrect.
+    """
+    stmt = select(Document).where(Document.id == id)
+    res = await db.execute(stmt)
+    doc = res.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    
+    try:
+        # Get representative text chunks from Elasticsearch
+        es_res = await search_store.client.search(
+            index=search_store.chunk_index,
+            body={
+                'query': {
+                    'bool': {
+                        'filter': [{'term': {'doc_id': str(id)}}],
+                        'must_not': [
+                            {'match_phrase': {'text': 'Fallback extraction'}},
+                            {'match_phrase': {'text': 'Go to Index'}},
+                            {'match_phrase': {'text': 'Continuation Sheet'}},
+                        ]
+                    }
+                },
+                'sort': [{'page_number': {'order': 'asc'}}],
+                '_source': ['text'],
+                'size': 20
+            }
+        )
+        
+        hits = es_res['hits']['hits']
+        chunks = [hit['_source'].get('text', '') for hit in hits
+                 if len(hit['_source'].get('text', '').split()) > 20]
+        
+        if not chunks:
+            raise HTTPException(status_code=422, detail="No meaningful text chunks found for this document. Cannot extract metadata.")
+        
+        sample_text = '\n\n'.join(chunks[:10])
+        
+        # Run metadata extraction with LLM
+        meta = await pdf_processor.extract_document_metadata(sample_text)
+        
+        # Update PostgreSQL
+        doc.keywords = meta.get('keywords') or []
+        doc.topics = meta.get('topics') or []
+        doc.entities = meta.get('entities') or []
+        doc.financial_terms = meta.get('financial_terms') or []
+        doc.circular_type = meta.get('circular_type') or 'Circular'
+        await db.commit()
+        await db.refresh(doc)
+        
+        # Update Qdrant payloads
+        qdrant_updated = 0
+        from qdrant_client.http import models as qmodels
+        offset = None
+        while True:
+            scroll_res = qdrant_store.client.scroll(
+                collection_name='document_chunks',
+                scroll_filter=qmodels.Filter(
+                    must=[qmodels.FieldCondition(key="doc_id", match=qmodels.MatchValue(value=str(id)))]
+                ),
+                limit=200,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False
+            )
+            points, next_offset = scroll_res
+            if not points:
+                break
+            qdrant_store.client.set_payload(
+                collection_name='document_chunks',
+                payload={
+                    'keywords': doc.keywords,
+                    'topics': doc.topics,
+                    'entities': doc.entities,
+                    'financial_terms': doc.financial_terms,
+                    'circular_type': doc.circular_type,
+                },
+                points=[p.id for p in points]
+            )
+            qdrant_updated += len(points)
+            if next_offset is None:
+                break
+            offset = next_offset
+        
+        # Update Elasticsearch chunks
+        es_update = await search_store.client.update_by_query(
+            index=search_store.chunk_index,
+            body={
+                'query': {'term': {'doc_id': str(id)}},
+                'script': {
+                    'source': 'ctx._source.keywords = params.keywords; ctx._source.topics = params.topics; ctx._source.entities = params.entities; ctx._source.financial_terms = params.financial_terms; ctx._source.circular_type = params.circular_type;',
+                    'params': {
+                        'keywords': doc.keywords,
+                        'topics': doc.topics,
+                        'entities': doc.entities,
+                        'financial_terms': doc.financial_terms,
+                        'circular_type': doc.circular_type,
+                    }
+                }
+            }
+        )
+        
+        return {
+            "status": "success",
+            "doc_id": str(id),
+            "keywords": doc.keywords,
+            "topics": doc.topics,
+            "entities": doc.entities,
+            "financial_terms": doc.financial_terms,
+            "circular_type": doc.circular_type,
+            "qdrant_points_updated": qdrant_updated,
+            "es_chunks_updated": es_update.get('updated', 0)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reindex metadata failed for doc {id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Metadata reindex failed: {str(e)}")
+
+
+@router.post("/database/repair")
+async def repair_database():
+    """
+    Cleans up boilerplate chunks (Go to Index, Continuation Sheet) from Elasticsearch
+    and refreshes the index. Run this if document retrieval returns garbage content.
+    """
+    try:
+        BOILERPLATE_PHRASES = ["Go to Index", "Continuation Sheet", "P a g e", "Part – A"]
+        total_deleted = 0
+        for phrase in BOILERPLATE_PHRASES:
+            del_res = await search_store.client.delete_by_query(
+                index=search_store.chunk_index,
+                body={'query': {'match_phrase': {'text': phrase}}}
+            )
+            deleted = del_res.get('deleted', 0)
+            total_deleted += deleted
+            if deleted > 0:
+                logger.info(f"Repair: Deleted {deleted} ES chunks containing '{phrase}'")
+        
+        await search_store.client.indices.refresh(index=search_store.chunk_index)
+        
+        es_count = await search_store.client.count(index=search_store.chunk_index)
+        
+        return {
+            "status": "success",
+            "boilerplate_chunks_deleted": total_deleted,
+            "remaining_chunks": es_count['count'],
+            "message": f"Removed {total_deleted} boilerplate chunks. {es_count['count']} valid chunks remain."
+        }
+    except Exception as e:
+        logger.error(f"Database repair failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database repair failed: {str(e)}")
+

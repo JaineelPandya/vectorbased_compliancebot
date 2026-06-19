@@ -17,6 +17,11 @@ class Document(Base):
     issue_date = Column(Date, nullable=True, index=True)
     department = Column(String, nullable=True, index=True)
     tags = Column(JSON, nullable=True)  # List of strings e.g., ["margin", "f&o"]
+    keywords = Column(JSON, nullable=True)
+    topics = Column(JSON, nullable=True)
+    entities = Column(JSON, nullable=True)
+    financial_terms = Column(JSON, nullable=True)
+    circular_type = Column(String, nullable=True)
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     pages = relationship("DocumentPage", back_populates="document", cascade="all, delete-orphan")

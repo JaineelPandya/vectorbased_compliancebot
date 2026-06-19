@@ -11,7 +11,7 @@ class QdrantStore:
     def __init__(self):
         self.url = settings.qdrant.url
         self.client = None
-        self.collections = ["text_chunks", "table_chunks", "graph_chunks", "scan_chunks"]
+        self.collection = "document_chunks"
         self.vector_size = 1024  # Matches BGE-M3 embedding dimension
         self.connect()
 
@@ -19,58 +19,54 @@ class QdrantStore:
         try:
             # Setup standard Qdrant Client
             self.client = QdrantClient(url=self.url)
-            self._init_collections()
+            self._init_collection()
         except Exception as e:
             logger.error(f"Failed to connect to Qdrant at {self.url}: {e}. Local mock mode may be triggered during execution.")
 
-    def _init_collections(self):
+    def _init_collection(self):
         if not self.client:
             return
         
-        for collection in self.collections:
+        try:
+            self.client.get_collection(collection_name=self.collection)
+            logger.info(f"Qdrant collection '{self.collection}' already exists.")
+        except (UnexpectedResponse, Exception):
+            logger.info(f"Creating Qdrant collection '{self.collection}'...")
             try:
-                # Check if collection exists
-                self.client.get_collection(collection_name=collection)
-                logger.info(f"Qdrant collection '{collection}' already exists.")
-            except (UnexpectedResponse, Exception):
-                logger.info(f"Creating Qdrant collection '{collection}'...")
-                try:
-                    self.client.create_collection(
-                        collection_name=collection,
-                        vectors_config=qmodels.VectorParams(
-                            size=self.vector_size,
-                            distance=qmodels.Distance.COSINE
-                        )
+                self.client.create_collection(
+                    collection_name=self.collection,
+                    vectors_config=qmodels.VectorParams(
+                        size=self.vector_size,
+                        distance=qmodels.Distance.COSINE
                     )
-                    logger.info(f"Successfully created collection '{collection}'.")
-                except Exception as e:
-                    logger.error(f"Error creating collection '{collection}': {e}")
+                )
+                logger.info(f"Successfully created collection '{self.collection}'.")
+            except Exception as e:
+                logger.error(f"Error creating collection '{self.collection}': {e}")
 
     async def upsert_chunks(
         self, 
-        collection: str, 
         points: List[Dict[str, Any]]
     ) -> bool:
         """
-        Upserts vectors and metadata payload into a Qdrant collection.
+        Upserts vectors and metadata payload into the document_chunks Qdrant collection.
         points is a list of dicts:
         {
            "id": uuid,
            "vector": list[float],
            "payload": {
+               "title": str,
                "doc_id": str,
                "page": int,
                "section": str,
+               "subsection": str,
+               "circular_number": str,
                "document_version": int,
-               "upload_date": str,
+               "type": str,
                "text": str
            }
         }
         """
-        if collection not in self.collections:
-            logger.error(f"Invalid Qdrant collection target: {collection}")
-            return False
-
         if not self.client:
             logger.warning("Qdrant client not connected. Simulating success.")
             return True
@@ -87,10 +83,10 @@ class QdrantStore:
                 )
             
             self.client.upsert(
-                collection_name=collection,
+                collection_name=self.collection,
                 points=q_points
             )
-            logger.info(f"Upserted {len(points)} vectors into {collection}.")
+            logger.info(f"Upserted {len(points)} vectors into {self.collection}.")
             return True
         except Exception as e:
             logger.error(f"Failed to upsert points to Qdrant: {e}")
@@ -98,19 +94,14 @@ class QdrantStore:
 
     async def search_collection(
         self,
-        collection: str,
         query_vector: List[float],
         limit: int = 5,
         filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Searches a Qdrant collection for similar vectors.
+        Searches the document_chunks collection for similar vectors.
         Supports filtering on metadata fields.
         """
-        if collection not in self.collections:
-            logger.error(f"Invalid Qdrant collection target: {collection}")
-            return []
-
         if not self.client:
             logger.warning("Qdrant client not connected. Returning empty search results.")
             return []
@@ -131,7 +122,7 @@ class QdrantStore:
                     q_filter = qmodels.Filter(must=must_conditions)
 
             response = self.client.query_points(
-                collection_name=collection,
+                collection_name=self.collection,
                 query=query_vector,
                 limit=limit,
                 query_filter=q_filter,
@@ -152,29 +143,27 @@ class QdrantStore:
             return []
 
     async def delete_document_vectors(self, doc_id: str) -> bool:
-        """Deletes all vectors associated with a document across all collections."""
+        """Deletes all vectors associated with a document from the document_chunks collection."""
         if not self.client:
             return True
 
         try:
-            for collection in self.collections:
-                self.client.delete(
-                    collection_name=collection,
-                    points_selector=qmodels.FilterSelector(
-                        filter=qmodels.Filter(
-                            must=[
-                                qmodels.FieldCondition(
-                                    key="doc_id",
-                                    match=qmodels.MatchValue(value=doc_id)
-                                )
-                            ]
-                        )
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="doc_id",
+                                match=qmodels.MatchValue(value=doc_id)
+                            )
+                        ]
                     )
                 )
-            logger.info(f"Deleted vectors for doc_id {doc_id} across all collections.")
+            )
+            logger.info(f"Deleted vectors for doc_id {doc_id} from {self.collection}.")
             return True
         except Exception as e:
             logger.error(f"Failed to delete Qdrant vectors for doc_id {doc_id}: {e}")
             return False
-
 qdrant_store = QdrantStore()

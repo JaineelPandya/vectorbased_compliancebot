@@ -37,6 +37,11 @@ class ElasticsearchStore:
                     "version": {"type": "integer"},
                     "department": {"type": "keyword"},
                     "tags": {"type": "keyword"},
+                    "keywords": {"type": "keyword"},
+                    "topics": {"type": "keyword"},
+                    "entities": {"type": "keyword"},
+                    "financial_terms": {"type": "keyword"},
+                    "circular_type": {"type": "keyword"},
                     "status": {"type": "keyword"},
                     "uploaded_at": {"type": "date"}
                 }
@@ -49,14 +54,23 @@ class ElasticsearchStore:
                 "properties": {
                     "chunk_id": {"type": "keyword"},
                     "doc_id": {"type": "keyword"},
-                    "page": {"type": "integer"},
+                    "title": {"type": "keyword"},
+                    "page_number": {"type": "integer"},
                     "section": {"type": "text"},
+                    "subsection": {"type": "text"},
+                    "parent_id": {"type": "keyword"},
+                    "type": {"type": "keyword"},
                     "text": {"type": "text", "analyzer": "english"},
                     "circular_number": {"type": "keyword"},
                     "issue_date": {"type": "date"},
                     "version": {"type": "integer"},
                     "department": {"type": "keyword"},
                     "tags": {"type": "keyword"},
+                    "keywords": {"type": "keyword"},
+                    "topics": {"type": "keyword"},
+                    "entities": {"type": "keyword"},
+                    "financial_terms": {"type": "keyword"},
+                    "circular_type": {"type": "keyword"},
                     "status": {"type": "keyword"}
                 }
             }
@@ -87,6 +101,11 @@ class ElasticsearchStore:
                 "version": metadata.get("version", 1),
                 "department": metadata.get("department"),
                 "tags": metadata.get("tags", []),
+                "keywords": metadata.get("keywords", []),
+                "topics": metadata.get("topics", []),
+                "entities": metadata.get("entities", []),
+                "financial_terms": metadata.get("financial_terms", []),
+                "circular_type": metadata.get("circular_type"),
                 "status": metadata.get("status", "active"),
                 "uploaded_at": metadata.get("uploaded_at")
             }
@@ -107,15 +126,24 @@ class ElasticsearchStore:
                 body = {
                     "chunk_id": chunk["chunk_id"],
                     "doc_id": chunk["doc_id"],
-                    "page": chunk["page"],
-                    "section": chunk.get("section", ""),
-                    "text": chunk["text"],
-                    "circular_number": chunk.get("circular_number"),
+                    "title": chunk.get("title") or "Unknown Title",
+                    "page_number": chunk.get("page") or chunk.get("page_number") or 1,
+                    "section": chunk.get("section") or "Unknown Section",
+                    "subsection": chunk.get("subsection") or "",
+                    "parent_id": chunk.get("parent_id") or "",
+                    "type": chunk.get("type") or "text",
+                    "text": chunk.get("text") or "",
+                    "circular_number": chunk.get("circular_number") or "",
                     "issue_date": chunk.get("issue_date"),
-                    "version": chunk.get("version"),
-                    "department": chunk.get("department"),
-                    "tags": chunk.get("tags", []),
-                    "status": chunk.get("status", "active")
+                    "version": chunk.get("document_version") or chunk.get("version") or 1,
+                    "department": chunk.get("department") or "Unknown",
+                    "tags": chunk.get("tags") or [],
+                    "keywords": chunk.get("keywords") or [],
+                    "topics": chunk.get("topics") or [],
+                    "entities": chunk.get("entities") or [],
+                    "financial_terms": chunk.get("financial_terms") or [],
+                    "circular_type": chunk.get("circular_type") or "",
+                    "status": chunk.get("status") or "active"
                 }
                 await self.client.index(index=self.chunk_index, id=chunk["chunk_id"], body=body)
             await self.client.indices.refresh(index=self.chunk_index)
@@ -215,12 +243,21 @@ class ElasticsearchStore:
                     "score": hit["_score"],
                     "payload": {
                         "doc_id": source["doc_id"],
-                        "page": source["page"],
-                        "section": source["section"],
-                        "text": source["text"],
+                        "title": source.get("title"),
+                        "page": source.get("page_number", source.get("page")),
+                        "section": source.get("section"),
+                        "subsection": source.get("subsection"),
+                        "parent_id": source.get("parent_id"),
+                        "type": source.get("type", "text"),
+                        "text": source.get("text"),
                         "circular_number": source.get("circular_number"),
                         "document_version": source.get("version"),
-                        "upload_date": source.get("issue_date")
+                        "upload_date": source.get("issue_date"),
+                        "keywords": source.get("keywords") or [],
+                        "topics": source.get("topics") or [],
+                        "entities": source.get("entities") or [],
+                        "financial_terms": source.get("financial_terms") or [],
+                        "circular_type": source.get("circular_type") or ""
                     }
                 })
             return ret
