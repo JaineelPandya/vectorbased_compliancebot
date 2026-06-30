@@ -12,26 +12,36 @@ class CrossEncoderReranker:
     @property
     def model(self):
         if self._model is None:
-            try:
-                # Use singleton pattern with MPS device and batch_size=32
-                self._model = CrossEncoder(self.model_name, device="mps")
-                logger.info(f"Loaded reranker model {self.model_name} with device=mps")
-            except Exception as e:
-                logger.exception(f"Failed to load reranker {self.model_name}: {e}")
-                self._model = None
+            for device in ["mps", "cpu"]:
+                try:
+                    self._model = CrossEncoder(self.model_name, device=device)
+                    logger.info(f"Loaded reranker model {self.model_name} with device={device}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to load reranker on device={device}: {e}")
+            if self._model is None:
+                logger.error(
+                    f"Reranker model {self.model_name} could not be loaded on any device. "
+                    "All chunks will receive rerank_score=0.0."
+                )
         return self._model
 
     def rerank(self, query: str, chunks: List[Dict[str, Any]], top_k: int = 8) -> List[Dict[str, Any]]:
         """Reranks a list of retrieved chunks using a CrossEncoder."""
         if not chunks:
             return []
-        
+
         if not self.model:
-            logger.warning("Reranker model not loaded. Returning original chunks.")
+            logger.warning(
+                "Reranker model not loaded. Assigning rerank_score=0.0 to all chunks "
+                "so downstream key access never crashes."
+            )
+            for chunk in chunks:
+                chunk.setdefault("rerank_score", 0.0)
             return chunks[:top_k]
 
-        # Log pairs being sent to CrossEncoder
-        pairs = [[query, chunk.get("text", "")] for chunk in chunks]
+        # Log pairs being sent to CrossEncoder. Prefer `reranker_text` if provided
+        pairs = [[query, (chunk.get("reranker_text") or chunk.get("text", ""))] for chunk in chunks]
         logger.info(f"Reranking {len(pairs)} pairs for query: {query[:60]}...")
         for idx, (q, text) in enumerate(pairs[:3]):
             page_num = chunks[idx].get("page", "N/A")
@@ -55,6 +65,10 @@ class CrossEncoderReranker:
             return reranked_chunks[:top_k]
         except Exception as e:
             logger.exception(f"Reranking failed: {e}")
+            # Inject rerank_score=0.0 so downstream .get("rerank_score", 0.0)
+            # calls and direct key accesses never raise KeyError.
+            for chunk in chunks:
+                chunk.setdefault("rerank_score", 0.0)
             return chunks[:top_k]
 
 reranker = CrossEncoderReranker()

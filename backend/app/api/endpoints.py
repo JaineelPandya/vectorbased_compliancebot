@@ -425,3 +425,204 @@ async def repair_database():
         logger.error(f"Database repair failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database repair failed: {str(e)}")
 
+
+# ---------------------------------------------------------------------------
+# Reindex endpoints (full pipeline re-ingest with new chunking schema)
+# ---------------------------------------------------------------------------
+
+@router.post("/documents/{id}/reindex")
+async def reindex_document(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Full re-ingest of an existing document:
+      1. Delete stale Qdrant vectors
+      2. Delete stale Elasticsearch chunks
+      3. Re-parse PDF from stored file path (matched by SHA-256 hash)
+      4. Generate new hierarchical chunks with subject-boosted embeddings
+      5. Insert into Qdrant + Elasticsearch
+
+    Response includes per-type chunk counts:
+      { doc_id, status, chunks_created, table_chunks, graph_chunks }
+    """
+    stmt = select(Document).where(Document.id == id)
+    res = await db.execute(stmt)
+    doc = res.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    doc_id_str = str(id)
+    upload_dir = settings.storage.upload_dir
+
+    # Locate stored PDF by SHA-256 hash match
+    pdf_path: Optional[str] = None
+    if os.path.isdir(upload_dir):
+        for fname in os.listdir(upload_dir):
+            if fname.endswith(".pdf"):
+                full = os.path.join(upload_dir, fname)
+                try:
+                    if pdf_processor.calculate_file_hash(full) == doc.hash:
+                        pdf_path = full
+                        break
+                except Exception:
+                    continue
+
+    if not pdf_path:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Original PDF file not found in upload directory for document {id}. "
+                "The file may have been cleaned up after initial ingest. "
+                "Please re-upload the document instead."
+            )
+        )
+
+    try:
+        doc.status = "processing"
+        await db.commit()
+
+        # 1. Delete stale vectors from Qdrant
+        await qdrant_store.delete_document_vectors(doc_id_str)
+        logger.info(f"[Reindex] Deleted Qdrant vectors for doc_id={doc_id_str}")
+
+        # 2. Delete stale chunks + metadata from Elasticsearch
+        await search_store.delete_document(doc_id_str)
+        logger.info(f"[Reindex] Deleted ES records for doc_id={doc_id_str}")
+
+        # 3. Delete existing DocumentPage records so they are recreated cleanly
+        from sqlalchemy import delete as sa_delete
+        await db.execute(sa_delete(DocumentPage).where(DocumentPage.document_id == id))
+        await db.commit()
+
+        # 4. Re-run full ingest pipeline
+        processed_doc = await pdf_processor.ingest_pdf(
+            file_path=pdf_path,
+            name=doc.name,
+            circular_number=doc.circular_number,
+            issue_date=doc.issue_date,
+            department=doc.department,
+            tags=doc.tags or [],
+            db=db
+        )
+
+        if not processed_doc:
+            raise HTTPException(status_code=500, detail="Reindex pipeline failed.")
+
+        stats = getattr(processed_doc, "_ingest_stats", {})
+        return {
+            "doc_id":         doc_id_str,
+            "status":         "success",
+            "chunks_created": stats.get("chunks_created", 0),
+            "table_chunks":   stats.get("table_chunks", 0),
+            "graph_chunks":   stats.get("graph_chunks", 0),
+            "message":        f"Document {id} successfully reindexed with hierarchical chunking."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reindex failed for document {id}: {e}")
+        doc.status = "failed"
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {str(e)}")
+
+
+@router.post("/documents/reindex_all")
+async def reindex_all_documents(db: AsyncSession = Depends(get_db)):
+    """
+    Bulk reindex all active documents.
+    Useful after schema migrations (e.g. adding content_type / subject / vision_confidence fields).
+
+    Returns per-document status and aggregate stats.
+    Processes documents sequentially to avoid overwhelming LLM and embedding services.
+    """
+    stmt = select(Document).where(Document.status == "active")
+    res = await db.execute(stmt)
+    active_docs = res.scalars().all()
+
+    if not active_docs:
+        return {
+            "status":         "success",
+            "docs_found":     0,
+            "docs_reindexed": 0,
+            "docs_failed":    0,
+            "results":        []
+        }
+
+    upload_dir = settings.storage.upload_dir
+    results:   List[dict] = []
+    reindexed  = 0
+    failed     = 0
+
+    for doc in active_docs:
+        doc_id_str = str(doc.id)
+
+        # Locate PDF by hash
+        pdf_path: Optional[str] = None
+        if os.path.isdir(upload_dir):
+            for fname in os.listdir(upload_dir):
+                if fname.endswith(".pdf"):
+                    full = os.path.join(upload_dir, fname)
+                    try:
+                        if pdf_processor.calculate_file_hash(full) == doc.hash:
+                            pdf_path = full
+                            break
+                    except Exception:
+                        continue
+
+        if not pdf_path:
+            logger.warning(f"[Reindex All] PDF not found for doc_id={doc_id_str} — skipping.")
+            results.append({
+                "doc_id": doc_id_str,
+                "name":   doc.name,
+                "status": "skipped",
+                "reason": "PDF file not found in upload directory"
+            })
+            failed += 1
+            continue
+
+        try:
+            # Delete stale data
+            await qdrant_store.delete_document_vectors(doc_id_str)
+            await search_store.delete_document(doc_id_str)
+            from sqlalchemy import delete as sa_delete
+            await db.execute(sa_delete(DocumentPage).where(DocumentPage.document_id == doc.id))
+            await db.commit()
+
+            # Re-ingest
+            processed = await pdf_processor.ingest_pdf(
+                file_path=pdf_path,
+                name=doc.name,
+                circular_number=doc.circular_number,
+                issue_date=doc.issue_date,
+                department=doc.department,
+                tags=doc.tags or [],
+                db=db
+            )
+            stats = getattr(processed, "_ingest_stats", {}) if processed else {}
+            results.append({
+                "doc_id":         doc_id_str,
+                "name":           doc.name,
+                "status":         "success",
+                "chunks_created": stats.get("chunks_created", 0),
+                "table_chunks":   stats.get("table_chunks", 0),
+                "graph_chunks":   stats.get("graph_chunks", 0)
+            })
+            reindexed += 1
+            logger.info(f"[Reindex All] Successfully reindexed doc_id={doc_id_str}")
+
+        except Exception as e:
+            logger.error(f"[Reindex All] Failed for doc_id={doc_id_str}: {e}")
+            results.append({
+                "doc_id": doc_id_str,
+                "name":   doc.name,
+                "status": "failed",
+                "reason": str(e)
+            })
+            failed += 1
+
+    return {
+        "status":         "complete",
+        "docs_found":     len(active_docs),
+        "docs_reindexed": reindexed,
+        "docs_failed":    failed,
+        "results":        results
+    }

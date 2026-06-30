@@ -22,6 +22,7 @@ class Document(Base):
     entities = Column(JSON, nullable=True)
     financial_terms = Column(JSON, nullable=True)
     circular_type = Column(String, nullable=True)
+    subject = Column(Text, nullable=True)   # P0: subject line extracted from first page
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     pages = relationship("DocumentPage", back_populates="document", cascade="all, delete-orphan")

@@ -24,7 +24,7 @@ services:
       - redis_data:/data
 
   qdrant:
-    image: qdrant/qdrant:v1.8.4
+    image: qdrant/qdrant:v1.18.0
     container_name: compliance_qdrant
     restart: always
     ports:

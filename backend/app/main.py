@@ -31,9 +31,19 @@ async def lifespan(app: FastAPI):
             await conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS entities JSONB"))
             await conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS financial_terms JSONB"))
             await conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS circular_type VARCHAR"))
+            # P0: subject field for all documents
+            await conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS subject TEXT"))
         logger.info("Database tables initialized and migrated successfully.")
     except Exception as e:
         logger.error(f"Database table initialization failed: {e}. Ensure PostgreSQL is running.")
+
+    # P1: Warm up reranker at startup so the model is ready on first query
+    try:
+        from backend.app.services.reranker import reranker
+        _ = reranker.model   # triggers model load now, not on first request
+        logger.info("Reranker model pre-loaded at startup.")
+    except Exception as e:
+        logger.warning(f"Reranker warm-up failed (non-fatal): {e}")
         
     yield
     logger.info("Shutting down API service...")

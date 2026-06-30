@@ -111,13 +111,23 @@ class QdrantStore:
             if filters:
                 must_conditions = []
                 for k, v in filters.items():
-                    if v is not None:
-                        must_conditions.append(
-                            qmodels.FieldCondition(
-                                key=k,
-                                match=qmodels.MatchValue(value=v)
-                            )
+                    if v is None:
+                        continue
+                    if isinstance(v, dict):
+                        if v:
+                            logger.warning(f"Dropping unsupported Qdrant filter '{k}' with nested dict value.")
+                        continue
+                    if isinstance(v, str) and not v.strip():
+                        continue
+                    if isinstance(v, (list, tuple)) and len(v) == 0:
+                        continue
+
+                    must_conditions.append(
+                        qmodels.FieldCondition(
+                            key=k,
+                            match=qmodels.MatchValue(value=v)
                         )
+                    )
                 if must_conditions:
                     q_filter = qmodels.Filter(must=must_conditions)
 

@@ -211,16 +211,26 @@ class ElasticsearchStore:
             
             if filters:
                 for k, v in filters.items():
-                    if v is not None:
-                        if k == "start_date" or k == "end_date":
-                            date_range = {}
-                            if k == "start_date":
-                                date_range["gte"] = v
-                            if k == "end_date":
-                                date_range["lte"] = v
-                            filter_queries.append({"range": {"issue_date": date_range}})
-                        else:
-                            filter_queries.append({"term": {k: v}})
+                    if v is None:
+                        continue
+                    if isinstance(v, dict):
+                        if v:
+                            logger.warning(f"Dropping unsupported Elasticsearch filter '{k}' with nested dict value.")
+                        continue
+                    if isinstance(v, str) and not v.strip():
+                        continue
+                    if isinstance(v, (list, tuple)) and len(v) == 0:
+                        continue
+
+                    if k == "start_date" or k == "end_date":
+                        date_range = {}
+                        if k == "start_date":
+                            date_range["gte"] = v
+                        if k == "end_date":
+                            date_range["lte"] = v
+                        filter_queries.append({"range": {"issue_date": date_range}})
+                    else:
+                        filter_queries.append({"term": {k: v}})
 
             query = {
                 "query": {
@@ -238,13 +248,29 @@ class ElasticsearchStore:
             ret = []
             for hit in hits:
                 source = hit["_source"]
+                # Bug 6 fix: resolve page number defensively.
+                # ES stores the field as page_number; the fallback source.get("page")
+                # does not exist in the ES mapping and always returns None without
+                # this guard.  Log any chunk that truly has no page_number stored.
+                page_val = source.get("page_number") or source.get("page")
+                if not page_val:
+                    logger.warning(
+                        f"[ES] Chunk id={hit['_id']} doc_id={source.get('doc_id')} "
+                        "has missing page_number in Elasticsearch. Defaulting to 1. "
+                        "Re-index this document to fix the stored metadata."
+                    )
+                    page_val = 1
                 ret.append({
                     "id": hit["_id"],
                     "score": hit["_score"],
                     "payload": {
                         "doc_id": source["doc_id"],
                         "title": source.get("title"),
-                        "page": source.get("page_number", source.get("page")),
+                        # Expose as both keys so hybrid_retrieval_agent's
+                        # payload.get("page_number") or payload.get("page")
+                        # always resolves correctly regardless of calling path.
+                        "page_number": page_val,
+                        "page": page_val,
                         "section": source.get("section"),
                         "subsection": source.get("subsection"),
                         "parent_id": source.get("parent_id"),

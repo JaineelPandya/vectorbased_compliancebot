@@ -39,12 +39,21 @@ class LLMConfig(BaseModel):
     reasoning_model: str = "qwen3:latest"
     vision_model: str = "qwen3-vl:latest"
     ollama_url: str = "http://localhost:11434"
-    temperature: float = 0.1
+    temperature: float = 0.3 
 
 class StorageConfig(BaseModel):
     upload_dir: str = "./storage/uploads"
     temp_dir: str = "./storage/temp"
     max_file_size_mb: int = 50
+
+class ChunkingConfig(BaseModel):
+    # TEXT pages — sliding window
+    text_chunk_size: int = 600        # Max characters per sliding window
+    text_overlap_sentences: int = 2   # Sentences to carry into next window
+    text_min_chunk_len: int = 30      # Minimum chars to keep a window
+    # TABLE pages — row-based split
+    table_max_rows: int = 20          # Max table rows per chunk
+    # GRAPH pages — always single chunk via vision pipeline
 
 class SystemSettings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
@@ -55,6 +64,7 @@ class SystemSettings(BaseModel):
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
 
 def load_settings() -> SystemSettings:
     """Loads system settings from YAML config and env vars."""
